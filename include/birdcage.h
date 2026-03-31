@@ -45,16 +45,6 @@ struct birdcage_hdr
   uintptr_t unused;
 };
 
-struct birdcage_used_hdr
-{
-  /* total size of the allocation, including pre + post padding */
-  uintptr_t size;
-
-  /* offset of this used_hdr from the start of where the
-   * former free_hdr used to be */
-  uintptr_t offset;
-};
-
 struct birdcage_bucket
 {
   struct birdcage_hdr* first_free;
