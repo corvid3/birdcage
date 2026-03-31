@@ -1,0 +1,5 @@
+.hcache
+.cache/
+target/
+compile_commands.json
+a.out
