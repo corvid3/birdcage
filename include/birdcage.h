@@ -64,6 +64,20 @@ birdcage_create(void* buffer, size_t buffer_size);
 void*
 birdcage_alloc_ex(struct birdcage*, size_t size, size_t alignment);
 
+void*
+birdcage_realloc_ex(struct birdcage* restrict cage,
+                    void* ptr,
+                    size_t newsize,
+                    size_t newalignment);
+
+inline void*
+birdcage_realloc(struct birdcage* restrict cage,
+                 void* restrict const ptr,
+                 size_t const size)
+{
+  return birdcage_realloc_ex(cage, ptr, size, alignof(max_align_t));
+}
+
 inline void*
 birdcage_alloc(struct birdcage* cage, size_t size)
 {

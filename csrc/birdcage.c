@@ -22,15 +22,21 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "birdcage.h"
 
 #define MAX(x, y) ((x > y) ? x : y)
+#define MIN(x, y) ((x < y) ? x : y)
 
 enum
 {
   /* also works as the minimum alignment */
   HDR_ALIGNMENT = 4,
+
+  MIN_BLOCK_SIZE = (1U << BIRDCAGE_BUCKET_START),
 };
 
 static size_t
@@ -78,23 +84,30 @@ hdrs_bucket(struct birdcage* restrict cage, struct birdcage_hdr* restrict hdr)
 static void
 add_to_list(struct birdcage_bucket* bucket, struct birdcage_hdr* hdr)
 {
+  if (bucket->first_free == hdr)
+    fprintf(stderr, "DOUBLE-FREE DETECTED!\n"), abort();
+
   if (bucket->first_free)
     bucket->first_free->prev = hdr;
   hdr->next = bucket->first_free;
   bucket->first_free = hdr;
+  hdr->prev = 0;
 }
 
 static void
-remove_from_list(struct birdcage_bucket* bucket,
-                 struct birdcage_hdr* hind,
-                 struct birdcage_hdr* hdr)
+remove_from_list(struct birdcage_bucket* bucket, struct birdcage_hdr* hdr)
 {
+  struct birdcage_hdr* const hind = hdr->prev;
+
   if (hind)
     hind->next = hdr->next;
   else
     bucket->first_free = hdr->next;
   if (hdr->next)
     hdr->next->prev = hind;
+
+  hdr->prev = 0;
+  hdr->next = 0;
 }
 
 static void
@@ -109,6 +122,12 @@ is_used(struct birdcage_hdr const* restrict hdr)
   return (uintptr_t)hdr->next & 1U;
 }
 
+static bool
+is_free(struct birdcage_hdr const* restrict hdr)
+{
+  return !is_used(hdr);
+}
+
 static void
 mark_used(struct birdcage_hdr* hdr)
 {
@@ -116,7 +135,7 @@ mark_used(struct birdcage_hdr* hdr)
 }
 
 static void
-mark_free(struct birdcage_hdr* restrict hdr)
+mark_free(struct birdcage_hdr* hdr)
 {
   hdr->next = (void*)hdr->next - 1;
 }
@@ -157,7 +176,6 @@ struct suitable
 
   /* node before the `this` allocation
    * if 0, then `this` is the start of the list */
-  struct birdcage_hdr* hind;
   struct birdcage_hdr* this;
 };
 
@@ -171,16 +189,21 @@ immediate_next(struct birdcage* cage, struct birdcage_hdr* restrict hdr)
 }
 
 static size_t
-alignment_padding(uintptr_t addr, size_t alignment)
+aligned_addr(uintptr_t const addr, uintptr_t const alignment)
 {
-  return (alignment - (addr % alignment)) % alignment;
+  return ((addr + (alignment - 1)) & ~(alignment - 1));
+}
+
+static size_t
+alignment_padding(uintptr_t const addr, uintptr_t const alignment)
+{
+  return aligned_addr(addr, alignment) - addr;
 }
 
 static size_t
 prepadding_alignment(struct birdcage_hdr* hdr, size_t alignment)
 {
-  size_t out = alignment_padding((uintptr_t)(hdr + 1), alignment);
-  return out;
+  return alignment_padding((uintptr_t)(hdr + 1), alignment);
 }
 
 static void*
@@ -209,9 +232,8 @@ find_suitable_allocation_from_bucket(struct birdcage_bucket* bucket,
                                      size_t alignment)
 {
   struct birdcage_hdr* hdr = bucket->first_free;
-  struct birdcage_hdr* hind = 0;
 
-  for (; hdr; hind = hdr, hdr = hdr->next) {
+  for (; hdr; hdr = hdr->next) {
     uintptr_t const total_consumption =
       total_allocation_size(hdr, size, alignment);
 
@@ -220,7 +242,6 @@ find_suitable_allocation_from_bucket(struct birdcage_bucket* bucket,
       out.prepadding = prepadding_alignment(hdr, alignment);
       out.total_consumption = total_consumption;
       out.this = hdr;
-      out.hind = hind;
       return out;
     }
   }
@@ -250,47 +271,44 @@ find_suitable_allocation(struct birdcage* restrict cage,
 }
 
 static void
-split(struct birdcage* restrict cage, struct suitable suitable)
+split(struct birdcage* restrict cage,
+      struct birdcage_hdr* this,
+      uintptr_t const consumption)
 {
-  enum
-  {
-    MIN_BLOCK_SIZE =
-      (1U << BIRDCAGE_BUCKET_START) + sizeof(struct birdcage_hdr),
-  };
 
-  size_t const size = suitable.this->size;
+  size_t const size = this->size;
 
   /* remember to include space for the header */
-  size_t const size_after_split =
-    size - suitable.total_consumption - sizeof(struct birdcage_hdr);
-
-  if (size_after_split < MIN_BLOCK_SIZE)
+  size_t const size_after_split = size - consumption;
+  if (size_after_split < MIN_BLOCK_SIZE + sizeof(struct birdcage_hdr))
     return;
 
-  suitable.this->size = suitable.total_consumption;
+  this->size = consumption;
 
-  struct birdcage_hdr* target =
-    (void*)(suitable.this + 1) + suitable.total_consumption;
-  target->size = size_after_split;
+  struct birdcage_hdr* target = (void*)(this + 1) + consumption;
+  target->size = size_after_split - sizeof(struct birdcage_hdr);
   target->prev = 0;
+  target->next = 0;
   insert(cage, target);
 }
 
-/* will insert the provided header back into a bucket */
 static void
 coalesce(struct birdcage* restrict cage, struct birdcage_hdr* hdr)
 {
   struct birdcage_hdr* imm_next = immediate_next(cage, hdr);
 
-  if (imm_next && !is_used(imm_next)) {
-    hdr->size += imm_next->size + sizeof *imm_next;
-    if (imm_next->prev)
-      imm_next->prev->next = imm_next->next;
-    else
-      hdrs_bucket(cage, hdr)->first_free = imm_next->next;
-  }
+  if (imm_next && is_free(imm_next)) {
+    struct birdcage_bucket* original_bucket = hdrs_bucket(cage, hdr);
 
-  insert(cage, hdr);
+    remove_from_list(hdrs_bucket(cage, imm_next), imm_next);
+    hdr->size += imm_next->size + sizeof *imm_next;
+    struct birdcage_bucket* new_bucket = hdrs_bucket(cage, hdr);
+
+    if (original_bucket != new_bucket) {
+      remove_from_list(original_bucket, hdr);
+      add_to_list(new_bucket, hdr);
+    }
+  }
 }
 
 static void
@@ -298,12 +316,11 @@ coalesce_bucket(struct birdcage* restrict cage,
                 struct birdcage_bucket* restrict bucket)
 {
   struct birdcage_hdr* hdr = bucket->first_free;
-  struct birdcage_hdr* hind = 0;
+
   while (hdr) {
-    remove_from_list(bucket, hind, hdr);
+    struct birdcage_hdr* const next = hdr->next;
     coalesce(cage, hdr);
-    hind = hdr;
-    hdr = hdr->next;
+    hdr = next;
   }
 }
 
@@ -322,53 +339,149 @@ make_used(struct suitable suitable)
   *dist_ptr = (uintptr_t)dist_ptr - (uintptr_t)suitable.this;
 }
 
+static struct suitable
+try_find_coalesce(struct birdcage* restrict cage,
+                  size_t const size,
+                  size_t const alignment)
+{
+  enum
+  {
+    /* since the free-list is not traversable in-order (LSA->MSA),
+     * it may take multiple coalescing attempts to properly
+     * group together free allocations and get a buffer
+     * that is large enough for the requested allocation.
+     * therefore, try multiple times, then fail. 3 sounds good. */
+    MAX_TRIES = 3,
+  };
+
+  for (unsigned i = 0; i < MAX_TRIES; i++) {
+    struct suitable const s = find_suitable_allocation(cage, size, alignment);
+    if (s.this)
+      return s;
+    coalesce_everything(cage);
+  }
+
+  return (struct suitable){ .this = 0 };
+}
+
 void*
 birdcage_alloc_ex(struct birdcage* restrict cage, size_t size, size_t alignment)
 {
+  if (size == 0)
+    return 0;
+
   alignment = MAX(alignment, HDR_ALIGNMENT);
 
-  bool try_once = false;
-  struct suitable s;
-try_again:
-  s = find_suitable_allocation(cage, size, alignment);
-
-  if (!s.this) {
-    if (!try_once) {
-      try_once = true;
-      /* coalesce the entire heap (expensive!)
-       * and then try again
-       * another alternative would be only to coalesce linearly
-       * until we can create a large enough block to fit our alloc,
-       * then quit early */
-      coalesce_everything(cage);
-      goto try_again;
-    }
-
+  struct suitable const s = try_find_coalesce(cage, size, alignment);
+  if (!s.this)
     return 0;
-  }
 
   /* split if needed */
-  remove_from_list(hdrs_bucket(cage, s.this), s.hind, s.this);
-  split(cage, s);
+  remove_from_list(hdrs_bucket(cage, s.this), s.this);
+  split(cage, s.this, s.total_consumption);
   make_used(s);
 
   return alloc_start(s);
 }
 
 static struct birdcage_hdr*
-extract_header(void* ptr)
+extract_header(void* const ptr)
 {
-  uintptr_t* ptr2 = (uintptr_t*)ptr - 1;
+  uintptr_t* const ptr2 = (uintptr_t*)ptr - 1;
   struct birdcage_hdr* out = (void*)ptr2 - *ptr2;
-  mark_free(out);
   return out;
 }
 
 void
-birdcage_free(struct birdcage* restrict cage, void* ptr)
+birdcage_free(struct birdcage* restrict cage, void* const ptr)
 {
+  if (!ptr)
+    return;
+
   struct birdcage_hdr* hdr = extract_header(ptr);
+  mark_free(hdr);
+  add_to_list(hdrs_bucket(cage, hdr), hdr);
   coalesce(cage, hdr);
+}
+
+static void*
+full_realloc(struct birdcage* restrict cage,
+             void* const ptr,
+             size_t const newsize,
+             size_t const newalignment,
+             size_t const old_size)
+{
+  void* out = birdcage_alloc_ex(cage, newsize, newalignment);
+  memcpy(out, ptr, MIN(old_size, newsize));
+  birdcage_free(cage, ptr);
+  return out;
+}
+
+static void*
+try_shrink(struct birdcage* restrict cage,
+           struct birdcage_hdr* const this_hdr,
+           void* const ptr,
+           size_t const consumption)
+{
+  split(cage, this_hdr, consumption);
+  struct birdcage_hdr* imm_next = immediate_next(cage, this_hdr);
+  assert(imm_next);
+  /* try to coalesce the freely created new block */
+  coalesce(cage, imm_next);
+  return ptr;
+}
+
+/* attempts to "eat" part of the next allocation, if free.
+ * "how much" is the byte amount of allocation to attempted
+ * to be added to the header */
+static void
+eat_next(struct birdcage* restrict cage,
+         struct birdcage_hdr* hdr,
+         size_t const how_much)
+{
+  struct birdcage_hdr* imm_next = immediate_next(cage, hdr);
+  if (is_used(imm_next))
+    return;
+  if (how_much > imm_next->size || imm_next->size - how_much < MIN_BLOCK_SIZE)
+    return;
+
+  remove_from_list(hdrs_bucket(cage, imm_next), imm_next);
+  struct birdcage_hdr* new = (void*)imm_next + how_much;
+  new->size = imm_next->size - how_much;
+  new->next = 0;
+  new->prev = 0;
+  hdr->size += how_much;
+  insert(cage, new);
+}
+
+void*
+birdcage_realloc_ex(struct birdcage* restrict cage,
+                    void* ptr,
+                    size_t const newsize,
+                    size_t const newalignment)
+{
+  if (ptr == 0)
+    return birdcage_alloc_ex(cage, newsize, newalignment);
+
+  struct birdcage_hdr* this_hdr = extract_header(ptr);
+
+  if (alignment_padding((uintptr_t)ptr, newalignment) != 0)
+    return full_realloc(cage, ptr, newsize, newalignment, this_hdr->size);
+
+  size_t const consumption =
+    total_allocation_size(this_hdr, newsize, newalignment);
+
+  if (this_hdr->size == consumption)
+    return ptr;
+
+  if (consumption > this_hdr->size) {
+    eat_next(cage, this_hdr, newsize - this_hdr->size);
+    if (this_hdr->size < newsize)
+      return full_realloc(cage, ptr, newsize, newalignment, this_hdr->size);
+    return ptr;
+  }
+
+  return try_shrink(cage, this_hdr, ptr, consumption);
 }
 
 /* provide an extern definition incase the compiler decides
@@ -376,3 +489,5 @@ birdcage_free(struct birdcage* restrict cage, void* ptr)
  * it is actually lying (at least in the case of GCC compiling) */
 extern inline void*
 birdcage_alloc(struct birdcage* cage, size_t size);
+extern inline void*
+birdcage_realloc(struct birdcage* restrict cage, void* ptr, size_t size);
