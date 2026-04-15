@@ -54,9 +54,13 @@ struct birdcage
 {
   void* ptr;
   size_t capacity;
+  size_t usage;
 
   struct birdcage_bucket buckets[BIRDCAGE_NUM_BUCKETS];
 };
+
+#define birdcage_used(cage) ((cage).usage)
+#define birdcage_unused(cage) ((cage).capacity - birdcage_used(cage))
 
 struct birdcage
 birdcage_create(void* buffer, size_t buffer_size);

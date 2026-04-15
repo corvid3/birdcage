@@ -146,6 +146,7 @@ birdcage_create(void* buffer, size_t buffer_size)
   struct birdcage out;
   out.ptr = buffer;
   out.capacity = buffer_size;
+  out.usage = 0;
 
   for (unsigned i = 0; i < BIRDCAGE_BUCKET_END - BIRDCAGE_BUCKET_START; i++)
     out.buckets[i].first_free = 0;
@@ -380,6 +381,7 @@ birdcage_alloc_ex(struct birdcage* restrict cage, size_t size, size_t alignment)
   remove_from_list(hdrs_bucket(cage, s.this), s.this);
   split(cage, s.this, s.total_consumption);
   make_used(s);
+  cage->usage += s.total_consumption;
 
   return alloc_start(s);
 }
@@ -400,6 +402,7 @@ birdcage_free(struct birdcage* restrict cage, void* const ptr)
 
   struct birdcage_hdr* hdr = extract_header(ptr);
   mark_free(hdr);
+  cage->usage -= hdr->size;
   add_to_list(hdrs_bucket(cage, hdr), hdr);
   coalesce(cage, hdr);
 }

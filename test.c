@@ -134,7 +134,12 @@ main()
   // realloc_test(&cage);
   shrink_test(&cage);
 
-  debug_print(&cage);
+  // debug_print(&cage);
+
+  void* ptr = birdcage_alloc(&cage, 1024);
+  printf("%i\n", cage.usage);
+  birdcage_free(&cage, ptr);
+  printf("%i\n", cage.usage);
 
   // char* x = birdcage_alloc(&cage, 1);
   // for (unsigned i = 1; i < 64; i++)
